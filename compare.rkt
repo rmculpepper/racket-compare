@@ -1,4 +1,5 @@
 #lang racket/base
+(require "private/compare.rkt")
 (provide natural-cmp
          natural<?
          natural>?

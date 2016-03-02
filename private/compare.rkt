@@ -1,6 +1,7 @@
 #lang racket/base
 (require racket/list
          racket/math
+         racket/date
          racket/fixnum
          racket/flonum)
 (provide general-cmp
@@ -34,8 +35,11 @@
   (let ([x xe] [y ye])
     (if (=? x y) '= (if (<? x y) '< '>))))
 
-(define-syntax-rule (lexico c1 c2)
-  (let ([c1v c1]) (if (eq? c1v '=) c2 c1v)))
+(define-syntax lexico
+  (syntax-rules ()
+    [(_ e) e]
+    [(_ e1 e2 ...)
+     (let ([v e1]) (if (eq? v '=) (lexico e2 ...) v))]))
 
 ;; all-perms-lexico : (Listof Comparison) -> Comparison
 ;; Returns x if all permutations of cmps lexicographically compare to x, else #f.
@@ -52,15 +56,7 @@
 ;; ============================================================
 
 (define-values (prop:compare prop:compare? prop:compare-ref)
-  (make-struct-type-property
-   'compare
-   (lambda (cmp _struct-info)
-     (unless (and (procedure? cmp)
-                  (procedure-arity-includes? cmp 3))
-       (raise-type-error 'prop:compare "procedure that accepts three arguments" cmp))
-     cmp)
-   null
-   #t))
+  (make-struct-type-property 'compare))
 
 ;; ============================================================
 
@@ -126,7 +122,7 @@
                        [ycmp (prop:compare-ref y)])
                    (and (equal? xcmp ycmp)
                         xcmp)))
-            => (xcmp x y recur)]
+            => (lambda (xcmp) (xcmp x y recur))]
     [fully-transparent-struct-type
      (lexico (vector-cmp (struct->vector x) (struct->vector y) 0 recur)
              (recur (fully-transparent-struct-type x)
@@ -191,6 +187,8 @@
     [#:else (hash-cmp* x y =? recur)]))
 
 (define (hash-cmp* x y =? recur)
+  (define (datum-cmp x y) (general-cmp x y #f))
+  (define (datum<? x y) (eq? (datum-cmp x y) '<))
   (define all-keys (append (hash-keys x) (hash-keys y)))
   (define sorted-keys (remove-duplicates (sort all-keys datum<?) =?))
   ;; Compare lexicographic wrt sorted keys, where any value > "undefined"
@@ -274,7 +272,7 @@
                         (cmp* < = (date-year-day x) (date-year-day y))
                         (cmp* < = (date-time-zone-offset x) (date-time-zone-offset y))
                         (cmp* string<? equal?
-                              (date*-time-zone-name x) (date-time-zone-name y)))))))
+                              (date*-time-zone-name x) (date*-time-zone-name y)))))))
 
 ;; ============================================================
 
@@ -322,3 +320,13 @@
 
 (define (genbytelist)
   (for/list ([i (random 20)]) (+ 97 (random 32))))
+
+;; ----
+
+(provide (struct-out wrap)
+         (struct-out twrap))
+(struct wrap (v)
+        #:property prop:compare
+        (lambda (x y recur)
+          (recur (wrap-v x) (wrap-v y))))
+(struct twrap (v) #:transparent)
