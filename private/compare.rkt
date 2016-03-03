@@ -77,10 +77,7 @@
     [bytes?
      (cmp* bytes<? bytes=? x y)]
     [symbol?
-     (cmp-rules x y
-       [symbol-interned? (cmp* symbol<? eq? x y)]
-       [symbol-unreadable? (cmp* symbol<? eq? x y)]
-       [#:else #| uninterned |# (cmp* symbol<? eq? x y)])]
+     (symbol-cmp x y)]
     [real?
      (real-cmp x y natural?)]
     [complex?
@@ -93,13 +90,9 @@
     [path-for-some-system?
      (cmp* bytes<? bytes=? (path->bytes x) (path->bytes y))]
     [regexp?
-     (cmp-rules x y
-       [pregexp? (recur (object-name x) (object-name y))]
-       [#:else (recur (object-name x) (object-name y))])]
+     (regexp-cmp x y)]
     [byte-regexp?
-     (cmp-rules x y
-       [byte-pregexp? (recur (object-name x) (object-name y))]
-       [#:else (recur (object-name x) (object-name y))])]
+     (byte-regexp-cmp x y)]
     [box?
      (recur (unbox x) (unbox y))]
     [fxvector?
@@ -114,6 +107,9 @@
      (lexico (recur (mcar x) (mcar y)) (recur (mcdr x) (mcdr y)))]
     [void? '=]
     [eof-object? '=]
+    [syntax?
+     (lexico (recur (syntax-e x) (syntax-e y))
+             #| if not eq?, then incomparable |# #f)]
     [prefab-struct-key
      (lexico (recur (prefab-struct-key x) (prefab-struct-key y))
              (vector-cmp (struct->vector x) (struct->vector y) 1 recur))]
@@ -129,6 +125,14 @@
                     (fully-transparent-struct-type y)))]
     ;; [#:cond extcmp (extcmp x y recur)]
     [#:else '#f]))
+
+;; ----------------------------------------
+
+(define (symbol-cmp x y)
+  (cmp-rules x y
+    [symbol-interned? (cmp* symbol<? eq? x y)]
+    [symbol-unreadable? (cmp* symbol<? eq? x y)]
+    [#:else #| uninterned |# (cmp* symbol<? eq? x y)]))
 
 ;; ----------------------------------------
 
@@ -247,6 +251,17 @@
 (define-indexed-cmp vector-cmp   vector-length   vector-ref)
 (define-indexed-cmp fxvector-cmp fxvector-length fxvector-ref)
 (define-indexed-cmp flvector-cmp flvector-length flvector-ref)
+
+;; ----------------------------------------
+
+(define (regexp-cmp x y)
+  (cmp-rules x y
+    [pregexp? (cmp* string<? string=? (object-name x) (object-name y))]
+    [#:else (cmp* string<? string=? (object-name x) (object-name y))]))
+(define (byte-regexp-cmp x y)
+  (cmp-rules x y
+    [byte-pregexp? (cmp* bytes<? bytes=? (object-name x) (object-name y))]
+    [#:else (cmp* bytes<? bytes=? (object-name x) (object-name y))]))
 
 ;; ----------------------------------------
 
