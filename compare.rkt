@@ -2,15 +2,13 @@
 (require (for-syntax racket/base))
 (provide (all-defined-out))
 
-;; A Comparison is one of '<, '=, '>, or #f
-;; A Comparator is (Any Any -> Comparison)
+;; Strict partial orders for Racket values
 
-(define (real/not-NaN? x) (and (real? x) (not (NaN? x))))
+;; A Comparison is one of '<, '=, '>, or #f, where #f means incomparable.
+
 (define (NaN? x) (or (eqv? x +nan.0) (eqv? x (real->single-flonum +nan.0))))
 
 ;; ============================================================
-
-;; Beware: comparison may diverge on cyclic input
 
 ;; For compatibilty with equal?, mutability is currently not considered for
 ;; strings, bytes, vectors, and boxes; but it is for hashes.
@@ -20,6 +18,7 @@
 ;;  B) by value then by type: eg 1 < 1.0 < 2 < 2.0 ...
 ;;  C) by value: 1 = 1.0 = 1.0f
 ;; A and B are compatible with eqv; C is compatible with = (except for NaN)
+;; Use B for datum-cmp and C for natural-cmp. A doesn't seem useful.
 
 ;; Comparing vectors: lexicographic rather than length-first (unlike srfi-67)
 
@@ -34,8 +33,26 @@
 ;; A1 is a subrelation of A2 and B1, which are both subrelations of B2.
 ;; A2,B2 coincide with subset order for (hashof X #t) set rep.
 
-;; Names: datum-cmp, value-cmp, natural-cmp, ???
+;; Prop: (null < everything else) implies ls <= (append ls b)
 
+;; Prop: datum-cmp, natural-cmp are partial orders even for cyclic data.
+;; - irreflexive: not (X < X).
+;; - <-transitive: if X < Y < Z, then X < Z.
+;;   Let Fxy be the position (fuel) where X differs from Y, likewise Fyz.
+;;   Since X < Y, Fxy is before a cycle in X is discovered.
+;;   X < Z at point min(Fxy, Fyz) <= Fxy, so still before cycle in X is discovered.
+;; - =-transitive: if X = Y = Z, then X = Z.
+;;   If cyclic subvalues in X and Y are skipped because eqv?, then same cyclic
+;;   subvalues must be present in Z.
+;; - =-symmetric: if X = Y, then Y = X
+;;   No if cycle checking is asymmetric (eg, xvisited but no yvisited)
+;;   Let l = (shared ([l (cons 'a l)]) l) and set FUEL = 0.
+;;   Then cmp((cons 'a l), l) is '=, but cmp(l, (cons 'a l)) is #f.
+;;   With cycle checking on both x and y, yes.
+
+;; Note: X = Y does *not* imply (cons A X) = (cons A Y), etc.
+;; A might exhaust fuel, and fewer things are comparable in cycle-checking mode
+;; than in fuel mode.
 
 #|
     null
@@ -60,6 +77,12 @@
 FIXME: extensible comparison?
 |#
 
+(define-syntax-rule (is-eqv? v)
+  (lambda (x) (eqv? x v)))
+
+(define-syntax-rule (negate f)
+  (lambda (x) (not (f x))))
+
 (define-syntax-rule (tcmp <? =? xe ye)
   (let ([x xe] [y ye])
     (cond [(=? x y) '=]
@@ -79,7 +102,7 @@ FIXME: extensible comparison?
     [(lexico c1 c2 ...) (lexico2 c1 (lexico c2 ...))]))
 
 (define-syntax-rule (lexico2 c1 c2)
-  (case c1 ((<) '<) ((=) c2) ((>) '>) ((#f) #f)))
+  (let ([result c1]) (if (eq? result '=) c2 result)))
 
 (define-syntax-rule (conj c1 c2)
   (let ([k (lambda () c2)])
@@ -97,11 +120,6 @@ FIXME: extensible comparison?
          (syntax-case c ()
            [[#:test test body ...]
             #'([test body ...])]
-           [[#:eqv? v body ...]
-            #'([(eqv? x v)
-                (cond [(eqv? y v) body ...]
-                      [else '<])]
-               [(eqv? y v) '>])]
            [[#:pred pred body ...]
             #'([(pred x)
                 (cond [(pred y) body ...]
@@ -122,31 +140,48 @@ FIXME: extensible comparison?
 
 ;; ------------------------------------------------------------
 
-(define (datum-cmp x y #:fuel [fuel #f])   (gen-cmp x y #f fuel))
-(define (natural-cmp x y #:fuel [fuel #f]) (gen-cmp x y #t fuel))
+(define (datum-cmp x y)   (safe-gen-cmp x y #f))
+(define (natural-cmp x y) (safe-gen-cmp x y #t))
 
-(define (datum<? x y) (eq? (datum-cmp x y) '<))
+(define (datum<? x y)   (eq? (datum-cmp x y) '<))
 (define (natural<? x y) (eq? (natural-cmp x y) '<))
-
-(define FUEL #e1e6)
-(define (try-datum<? x y [fuel FUEL]) (eq? (datum-cmp x y fuel) '<))
-(define (try-natural<? x y [fuel FUEL]) (eq? (natural-cmp x y fuel) '<))
 
 ;; ------------------------------------------------------------
 
-(define (gen-cmp x y natural? fuel xvisited)
+(define FUEL #e1e6)
+(define CYCLE (gensym 'cycle))
+(define OUT-OF-FUEL (gensym 'out-of-fuel))
+
+(define (safe-gen-cmp x y natural?)
+  (with-handlers ([(lambda (e) (eq? e OUT-OF-FUEL))
+                   (lambda (e)
+                     (eprintf "out of fuel\n")
+                     (with-handlers ([(lambda (e) (eq? e CYCLE))
+                                      (lambda (e)
+                                        (eprintf "cycle detected\n")
+                                        #f)])
+                       (gen-cmp x y natural? #f #t)))])
+    (gen-cmp x y #f FUEL #f)))
+
+(define (gen-cmp x y natural? fuel detect-cycles?)
+  (define xvisited (and detect-cycles? (make-hash)))
+  (define yvisited (and detect-cycles? (make-hash)))
   (define (recur x y)
-    (cond [xvisited
-           (cond [(hash-ref xvisited x #f) #f]
+    (cond [(and fuel (begin0 (zero? fuel) (set! fuel (sub1 fuel))))
+           (raise OUT-OF-FUEL)]
+          [detect-cycles?
+           (cond [(hash-ref xvisited x #f) (raise CYCLE)]
+                 [(hash-ref yvisited y #f) (raise CYCLE)]
                  [else
                   (hash-set! xvisited x #t)
+                  (hash-set! yvisited y #t)
                   (begin0 (recur* x y)
-                    (hash-remove! xvisited x))])]
+                    (hash-remove! xvisited x)
+                    (hash-remove! yvisited y))])]
           [else (recur* x y)]))
   (define (recur* x y)
     (with-cmp-cases x y
       [#:test (eqv? x y) '=]
-      [#:test (and fuel (begin0 (zero? fuel) (set! fuel (sub1 fuel)))) '#f]
       ;; Lists
       [#:pred null? '=]
       [#:pred pair?
@@ -160,7 +195,7 @@ FIXME: extensible comparison?
                (real-cmp (imag-part x) (imag-part y) natural?))]
       ;; Other atomic/simple
       [#:pred boolean?
-       (with-cmp-cases x y [#:eqv? #f '=] [#:else '=])]
+       (with-cmp-cases x y [#:pred (is-eqv? #f) '=] [#:else '=])]
       [#:pred char?
        (tcmp char<? char=? x y)]
       [#:pred symbol?
@@ -182,7 +217,7 @@ FIXME: extensible comparison?
        (pcmp path<? equal? x y)]
       [#:pred regexp?
        (lexico (with-cmp-cases x y
-                 [#:pred (lambda (v) (not (pregexp? v))) '=]
+                 [#:pred (negate pregexp?) '=]
                  [#:else '=])
                (recur (object-name x) (object-name y)))]
       ;; Other compound
@@ -222,7 +257,7 @@ FIXME: extensible comparison?
 
 (define (real-cmp x y natural?)
   (with-cmp-cases x y
-    [#:pred (lambda (x) (not (NaN? x)))
+    [#:pred (negate NaN?)
      (lexico (tcmp < = x y)
              (if natural? '= (real-type/sign-cmp x y)))]
     [#:else (if natural? '= (real-type-cmp x y))]))
@@ -232,11 +267,11 @@ FIXME: extensible comparison?
   ;; -1.0 < -1 < -0.0 < 0 < 0.0 < 1 < 1.0
   (cond [(zero? x)
          (with-cmp-cases x y
-           [#:eqv? -0.0 '=]
-           [#:eqv? (real->single-flonum -0.0) '=]
-           [#:eqv? 0 '=]
-           [#:eqv? (real->single-flonum 0.0)  '=]
-           [#:eqv? 0.0 '=])]
+           [#:pred (is-eqv? -0.0) '=]
+           [#:pred (is-eqv? (real->single-flonum -0.0)) '=]
+           [#:pred (is-eqv? 0) '=]
+           [#:pred (is-eqv? (real->single-flonum 0.0))  '=]
+           [#:pred (is-eqv? 0.0) '=])]
         [(positive? x) (real-type-cmp x y)]
         [else (real-type-cmp y x)]))
 
@@ -248,7 +283,7 @@ FIXME: extensible comparison?
 
 (define (hash-type-cmp x y)
   (lexico (with-cmp-cases x y [#:pred hash-eq? '=] [#:pred hash-eqv? '=] [#:pred hash-equal? '=])
-          (with-cmp-cases x y [#:pred (lambda (v) (not (hash-weak? v))) '=] [#:else '=])
+          (with-cmp-cases x y [#:pred (negate hash-weak?) '=] [#:else '=])
           (with-cmp-cases x y [#:pred immutable? '=] [#:else '=])))
 
 ;; weak inspector controls no struct types;
@@ -273,5 +308,5 @@ FIXME: extensible comparison?
 
 (define (struct-type-cmp xtype ytype)
   (lexico (pcmp symbol<? eq? (object-name xtype) (object-name ytype))
-          (lexico (pcmp < = (eq-hash-code xtype) (eq-hash-code ytype))
-                  #f)))
+          (pcmp < = (eq-hash-code xtype) (eq-hash-code ytype))
+          #f))
