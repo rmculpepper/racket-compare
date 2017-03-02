@@ -2,8 +2,6 @@
 (require (for-syntax racket/base))
 (provide (all-defined-out))
 
-;; Strict partial orders for Racket values
-
 ;; A Comparison is one of '<, '=, '>, or #f, where #f means incomparable.
 
 (define (NaN? x) (or (eqv? x +nan.0) (eqv? x (real->single-flonum +nan.0))))
@@ -12,12 +10,14 @@
 
 ;; For compatibilty with equal?, mutability is currently not considered for
 ;; strings, bytes, vectors, and boxes; but it is for hashes.
+;; Thus (vector-immutable 1 2 3) = (vector 1 2 3) and (box 1) = (immutable-box 1)
+;; but (make-hash '((a . 1) (b . 2))) != (make-immutable-hash '((a . 1) (b . 2)))
 
 ;; Comparing numbers:
 ;;  A) by type then by value: eg 1 < 2 < 3 < ... 1.0 < 2.0 < 3.0
 ;;  B) by value then by type: eg 1 < 1.0 < 2 < 2.0 ...
 ;;  C) by value: 1 = 1.0 = 1.0f
-;; A and B are compatible with eqv; C is compatible with = (except for NaN)
+;; A and B are like eqv?; C is like with = (except for NaN).
 ;; Use B for datum-cmp and C for natural-cmp. A doesn't seem useful.
 
 ;; Comparing vectors: lexicographic rather than length-first (unlike srfi-67)
@@ -32,6 +32,18 @@
 ;;     B2) union of keys, absent < any value
 ;; A1 is a subrelation of A2 and B1, which are both subrelations of B2.
 ;; A2,B2 coincide with subset order for (hashof X #t) set rep.
+;; A2 seems reasonable.
+
+;; Handling cyclic data:
+;; - Must not diverge on cyclic data, else useless for generic situations like
+;;   sorting set contents for pretty-printing.
+;; - Fuel-limited version alone is a partial order (I think), but loses
+;;   compatibility property: if A = A' and B = B' then (cons A B) = (cons A' B'),
+;;   because |A|+|B|+1 might exhaust fuel even though neither |A| nor |B| does.
+;; - So try fuel-limited first, then fall back to cycle-detecting version.
+;; - Cycle detection: rather than detecting cycles of pairs of arguments (needs
+;;   eq-eq binary hash), abort if cycle detected on *both* arguments.
+
 
 ;; Prop: (null < everything else) implies ls <= (append ls b)
 
@@ -39,8 +51,8 @@
 ;; - irreflexive: not (X < X).
 ;; - <-transitive: if X < Y < Z, then X < Z.
 ;;   Let Fxy be the position (fuel) where X differs from Y, likewise Fyz.
-;;   Since X < Y, Fxy is before a cycle in X is discovered.
-;;   X < Z at point min(Fxy, Fyz) <= Fxy, so still before cycle in X is discovered.
+;;   Since X < Y, Fxy is before a cycle is discovered.
+;;   X < Z at point min(Fxy, Fyz) <= Fxy, so still before cycle is discovered.
 ;; - =-transitive: if X = Y = Z, then X = Z.
 ;;   If cyclic subvalues in X and Y are skipped because eqv?, then same cyclic
 ;;   subvalues must be present in Z.
@@ -48,34 +60,22 @@
 ;;   No if cycle checking is asymmetric (eg, xvisited but no yvisited)
 ;;   Let l = (shared ([l (cons 'a l)]) l) and set FUEL = 0.
 ;;   Then cmp((cons 'a l), l) is '=, but cmp(l, (cons 'a l)) is #f.
-;;   With cycle checking on both x and y, yes.
+;;   Yes with cycle checking on both x and y.
 
-;; Note: X = Y does *not* imply (cons A X) = (cons A Y), etc.
-;; A might exhaust fuel, and fewer things are comparable in cycle-checking mode
-;; than in fuel mode.
+;; Conjecture: if exists FUEL s.t. cmp_fuel(X, Y, FUEL) = C,
+;; then cmp_cycle(X, Y) = C.
 
-#|
-    null
-  < pair
-    ;; Atomic:
-  < number (!)
-  < boolean
-  < character
-  < symbol
-  < keyword
-  < string
-  < bytes
-  < path
-  < regexp
-    ;; Other Compound:
-  < vector
-  < box
-  < hash
-  < prefab-struct
-  < fully-transparent-struct
+;; Conjecture: X = X' and Y = Y' implies (cons X Y) = (cons X' Y')
+;; Should be true unless previous conjecture is false and the fuel threshold is
+;; exhausted.
 
-FIXME: extensible comparison?
-|#
+;; Note: more ambitious cyclic comparison would be hard; example:
+;; - x = (list y x 1), y = (list x y 2), cmp(x, y)
+;;   cmp(x, y) = lexico( cmp(y, x), cmp(x, y), cmp(1, 2) )
+;;             = lexico( eq, eq, lt )   -- using "assume equal on recur"
+;;             = lt
+;;       check:  lexico( cmp(y, x), cmp(x, y), cmp(1, 2) ) assuming cmp(x, y) = lt
+;;             = lexico( gt, lt, lt ) = gt  -- inconsistent!
 
 (define-syntax-rule (is-eqv? v)
   (lambda (x) (eqv? x v)))
@@ -148,7 +148,7 @@ FIXME: extensible comparison?
 
 ;; ------------------------------------------------------------
 
-(define FUEL #e1e6)
+(define FUEL 0) ;;#e1e6)
 (define CYCLE (gensym 'cycle))
 (define OUT-OF-FUEL (gensym 'out-of-fuel))
 
@@ -166,22 +166,29 @@ FIXME: extensible comparison?
 (define (gen-cmp x y natural? fuel detect-cycles?)
   (define xvisited (and detect-cycles? (make-hash)))
   (define yvisited (and detect-cycles? (make-hash)))
+  (define xcycle 0)
+  (define ycycle 0)
   (define (recur x y)
-    (cond [(and fuel (begin0 (zero? fuel) (set! fuel (sub1 fuel))))
+    (cond [(eqv? x y) '=]
+          [(and fuel (begin0 (zero? fuel) (set! fuel (sub1 fuel))))
            (raise OUT-OF-FUEL)]
           [detect-cycles?
-           (cond [(hash-ref xvisited x #f) (raise CYCLE)]
-                 [(hash-ref yvisited y #f) (raise CYCLE)]
-                 [else
-                  (hash-set! xvisited x #t)
-                  (hash-set! yvisited y #t)
-                  (begin0 (recur* x y)
-                    (hash-remove! xvisited x)
-                    (hash-remove! yvisited y))])]
+           (define new-xcycle? (hash-ref xvisited x #f))
+           (define new-ycycle? (hash-ref yvisited y #f))
+           (when new-xcycle? (set! xcycle (add1 xcycle)))
+           (when new-ycycle? (set! ycycle (add1 ycycle)))
+           (when (and (positive? xcycle) (positive? ycycle))
+             (raise CYCLE))
+           (hash-set! xvisited x #t)
+           (hash-set! yvisited y #t)
+           (begin0 (recur* x y)
+             (hash-remove! xvisited x)
+             (hash-remove! yvisited y)
+             (when new-xcycle? (set! xcycle (sub1 xcycle)))
+             (when new-ycycle? (set! ycycle (sub1 ycycle))))]
           [else (recur* x y)]))
   (define (recur* x y)
     (with-cmp-cases x y
-      [#:test (eqv? x y) '=]
       ;; Lists
       [#:pred null? '=]
       [#:pred pair?
