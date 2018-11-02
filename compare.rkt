@@ -4,10 +4,6 @@
 
 ;; A Comparison is one of '<, '=, '>, or #f, where #f means incomparable.
 
-(define (NaN? x) (or (eqv? x +nan.0) (eqv? x (real->single-flonum +nan.0))))
-
-;; ============================================================
-
 ;; For compatibilty with equal?, mutability is currently not considered for
 ;; strings, bytes, vectors, and boxes; but it is for hashes.
 ;; Thus (vector-immutable 1 2 3) = (vector 1 2 3) and (box 1) = (immutable-box 1)
@@ -77,33 +73,40 @@
 ;;       check:  lexico( cmp(y, x), cmp(x, y), cmp(1, 2) ) assuming cmp(x, y) = lt
 ;;             = lexico( gt, lt, lt ) = gt  -- inconsistent!
 
+;; ============================================================
+
+(define (NaN? x) (or (eqv? x +nan.0) (eqv? x (real->single-flonum +nan.0))))
+
 (define-syntax-rule (is-eqv? v)
   (lambda (x) (eqv? x v)))
 
 (define-syntax-rule (negate f)
   (lambda (x) (not (f x))))
 
-(define-syntax-rule (tcmp <? =? xe ye)
-  (let ([x xe] [y ye])
-    (cond [(=? x y) '=]
-          [(<? x y) '<]
-          [else '>])))
+;; base-cmp : (X X -> Bool) (X X -> Bool) X X -> Comparison
+(define (base-cmp <? =? x y)
+  (cond [(=? x y) '=]
+        [(<? x y) '<]
+        [(<? y x) '>]
+        [else #f]))
 
-(define-syntax-rule (pcmp <? =? xe ye)
-  (let ([x xe] [y ye])
-    (cond [(=? x y) '=]
-          [(<? x y) '<]
-          [(<? y x) '>]
-          [else #f])))
+;; total-cmp : (X X -> Bool) (X X -> Bool) X X -> Comparison
+;; like base-cmp except x, y known to be {<?,=?}-comparable
+(define (total-cmp <? =? x y)
+  (cond [(=? x y) '=]
+        [(<? x y) '<]
+        [else '>]))
 
+;; (lexico C1 ... CN) combines comparisons C1..CN lexicographically;
+;; that is, it returns the first non-= result (or = if all =).
 (define-syntax lexico
   (syntax-rules ()
     [(lexico c) c]
-    [(lexico c1 c2 ...) (lexico2 c1 (lexico c2 ...))]))
+    [(lexico c1 c2 ...)
+     (let ([r1 c1])
+       (if (eq? result '=) (lexico c2 ...) r1))]))
 
-(define-syntax-rule (lexico2 c1 c2)
-  (let ([result c1]) (if (eq? result '=) c2 result)))
-
+;; (conj C1 C2) conjoins comparisons C1 and C2; cf derived partial order on function space
 (define-syntax-rule (conj c1 c2)
   (let ([k (lambda () c2)])
     (case c1
@@ -112,14 +115,15 @@
       [(>) (case (k) [(> =) '>] [else #f])]
       [(#f) #f])))
 
+;; with-cmp-cases compares two variables by ascending predicate then by custom comparisons
+;; Example: (with-cmp-case x y [#:pred A? (A-cmp x y)] [#:pred B? (B-cmp x y)])
+;;   If x:A, y:B, then x < y. If x:B, y:A, then x > y. If x:A, y:A, then use A-cmp.
 (define-syntax (with-cmp-cases stx)
   (syntax-case stx ()
     [(wcc x y clause ...)
      (let ()
        (define (handle-clause c)
          (syntax-case c ()
-           [[#:test test body ...]
-            #'([test body ...])]
            [[#:pred pred body ...]
             #'([(pred x)
                 (cond [(pred y) body ...]
@@ -163,9 +167,11 @@
                        (gen-cmp x y natural? #f #t)))])
     (gen-cmp x y #f FUEL #f)))
 
+;; ----
+
 (define (gen-cmp x y natural? fuel detect-cycles?)
-  (define xvisited (and detect-cycles? (make-hash)))
-  (define yvisited (and detect-cycles? (make-hash)))
+  (define xvisited (and detect-cycles? (make-hasheq)))
+  (define yvisited (and detect-cycles? (make-hasheq)))
   (define xcycle 0)
   (define ycycle 0)
   (define (recur x y)
@@ -221,7 +227,7 @@
        (tcmp bytes<? bytes=? x y)]
       [#:pred path-for-some-system?
        ;; FIXME: type?
-       (pcmp path<? equal? x y)]
+       (base-cmp path<? equal? x y)]
       [#:pred regexp?
        (lexico (with-cmp-cases x y
                  [#:pred (negate pregexp?) '=]
@@ -229,7 +235,7 @@
                (recur (object-name x) (object-name y)))]
       ;; Other compound
       [#:pred vector?
-       (vector-cmp x y natural?)]
+       (vector-cmp x y 0)]
       [#:pred box?
        (recur (unbox x) (unbox y))]
       [#:pred hash?
@@ -245,11 +251,11 @@
       [#:pred=> prefab-struct-key
        (lambda (xkey ykey)
          (lexico (prefab-struct-key-cmp xkey ykey)
-                 (vector-cmp (struct->vector x) (struct->vector y) 1 natural?)))]
+                 (vector-cmp (struct->vector x) (struct->vector y) 1)))]
       [#:pred=> fully-transparent-struct-type
        (lambda (xtype ytype)
          (lexico (struct-type-cmp xtype ytype)
-                 (vector-cmp (struct->vector x) (struct->vector y) 1 natural?)))]
+                 (vector-cmp (struct->vector x) (struct->vector y) 1)))]
       [#:else #f]))
   (define (vector-cmp x y i)
     (let ([n (min (vector-length x) (vector-length y))])
@@ -314,6 +320,6 @@
   (datum-cmp xkey ykey))
 
 (define (struct-type-cmp xtype ytype)
-  (lexico (pcmp symbol<? eq? (object-name xtype) (object-name ytype))
-          (pcmp < = (eq-hash-code xtype) (eq-hash-code ytype))
+  (lexico (base-cmp symbol<? eq? (object-name xtype) (object-name ytype))
+          (base-cmp < = (eq-hash-code xtype) (eq-hash-code ytype))
           #f))
